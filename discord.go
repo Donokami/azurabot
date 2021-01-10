@@ -8,45 +8,40 @@ import (
 )
 
 // DiscordConnect make a new connection to Discord
-func (b *Bot) DiscordConnect() (err error) {
-	b.dg, err = discordgo.New("Bot " + b.config.DiscordToken)
+func DiscordConnect() (err error) {
+	dg, err = discordgo.New("Bot " + o.DiscordToken)
 	if err != nil {
 		log.Println("FATA: error creating Discord session,", err)
 		return
 	}
-
-	log.Println("INFO: Bot is opening...")
-	b.dg.AddHandler(b.MessageCreateHandler)
-	b.dg.AddHandler(b.GuildCreateHandler)
-	b.dg.AddHandler(b.GuildDeleteHandler)
-	b.dg.AddHandler(b.ConnectHandler)
-
+	log.Println("INFO: Bot is Opening")
+	dg.AddHandler(MessageCreateHandler)
+	dg.AddHandler(GuildCreateHandler)
+	dg.AddHandler(GuildDeleteHandler)
+	dg.AddHandler(ConnectHandler)
 	// Open Websocket
-	err = b.dg.Open()
+	err = dg.Open()
 	if err != nil {
 		log.Println("FATA: Error Open():", err)
 		return
 	}
-
-	// Get current user (testing for successful login)
-	_, err = b.dg.User("@me")
+	_, err = dg.User("@me")
 	if err != nil {
+		// Login unsuccessful
 		log.Println("FATA:", err)
 		return
-	}
-
+	} // Login successful
+	log.Println("INFO: Bot user test")
 	log.Println("INFO: Bot is now running. Press CTRL-C to exit.")
-
-	b.purgeRoutine()
-	b.initRoutine()
-
-	b.dg.UpdateStatus(0, b.config.DiscordStatus)
+	purgeRoutine()
+	initRoutine()
+	dg.UpdateStatus(0, o.DiscordStatus)
 	return nil
 }
 
 // SearchVoiceChannel search the voice channel id into from guild.
-func (b Bot) SearchVoiceChannel(user string) (voiceChannelID string) {
-	for _, g := range b.dg.State.Guilds {
+func SearchVoiceChannel(user string) (voiceChannelID string) {
+	for _, g := range dg.State.Guilds {
 		for _, v := range g.VoiceStates {
 			if v.UserID == user {
 				return v.ChannelID
@@ -57,42 +52,86 @@ func (b Bot) SearchVoiceChannel(user string) (voiceChannelID string) {
 }
 
 // SearchGuild search the guild ID
-func (b Bot) SearchGuild(textChannelID string) (guildID string) {
-	channel, _ := b.dg.Channel(textChannelID)
+func SearchGuild(textChannelID string) (guildID string) {
+	channel, _ := dg.Channel(textChannelID)
 	guildID = channel.GuildID
 	return
 }
 
-// ChMessageSend send a message and auto-remove it in a time
-func (b *Bot) ChMessageSend(textChannelID, message string) {
+// AddTimeDuration calculate the total time duration
+func AddTimeDuration(t TimeDuration) (total TimeDuration) {
+	total.Second = t.Second % 60
+	t.Minute = t.Minute + t.Second/60
+	total.Minute = t.Minute % 60
+	t.Hour = t.Hour + t.Minute/60
+	total.Hour = t.Hour % 24
+	total.Day = t.Day + t.Hour/24
+	return
+}
+
+// ChMessageSendEmbed
+func ChMessageSendEmbed(textChannelID, title, description string) {
+	embed := discordgo.MessageEmbed{}
+	embed.Title = title
+	embed.Description = description
+	embed.Color = 0xb20000
 	for i := 0; i < 10; i++ {
-		msg, err := b.dg.ChannelMessageSend(textChannelID, message)
+		msg, err := dg.ChannelMessageSendEmbed(textChannelID, &embed)
 		if err != nil {
 			time.Sleep(1 * time.Second)
 			continue
 		}
+		msgToPurgeQueue(msg)
+		break
+	}
+}
 
-		if b.config.DiscordPurgeTime > 0 {
-			timestamp := time.Now().UTC().Unix()
-			message := PurgeMessage{
-				msg.ID,
-				msg.ChannelID,
-				timestamp,
-			}
-			b.purgeQueue = append(b.purgeQueue, message)
+// ChMessageSendHold send a message
+func ChMessageSendHold(textChannelID, message string) {
+	for i := 0; i < 10; i++ {
+		_, err := dg.ChannelMessageSend(textChannelID, message)
+		if err != nil {
+			time.Sleep(1 * time.Second)
+			continue
 		}
 		break
 	}
 }
 
-// Routinely purges messages older than the purge time specified in the configuration.
-func (b *Bot) purgeRoutine() {
+// ChMessageSend send a message and auto-remove it in a time
+func ChMessageSend(textChannelID, message string) {
+	for i := 0; i < 10; i++ {
+		msg, err := dg.ChannelMessageSend(textChannelID, message)
+		if err != nil {
+			time.Sleep(1 * time.Second)
+			continue
+		}
+		msgToPurgeQueue(msg)
+		break
+	}
+}
+
+// msgToPurgeQueue
+func msgToPurgeQueue(m *discordgo.Message) {
+	if o.DiscordPurgeTime > 0 {
+		timestamp := time.Now().UTC().Unix()
+		message := PurgeMessage{
+			m.ID,
+			m.ChannelID,
+			timestamp,
+		}
+		purgeQueue = append(purgeQueue, message)
+	}
+}
+
+// purgeRoutine
+func purgeRoutine() {
 	go func() {
 		for {
-			for k, v := range b.purgeQueue {
-				if time.Now().Unix()-b.config.DiscordPurgeTime > v.TimeSent {
-					b.purgeQueue = append(b.purgeQueue[:k], b.purgeQueue[k+1:]...)
-					b.dg.ChannelMessageDelete(v.ChannelID, v.ID)
+			for k, v := range purgeQueue {
+				if time.Now().Unix()-o.DiscordPurgeTime > v.TimeSent {
+					purgeQueue = append(purgeQueue[:k], purgeQueue[k+1:]...)
+					dg.ChannelMessageDelete(v.ChannelID, v.ID)
 					// Break at first match to avoid panic, timing isn't that important here
 					break
 				}
@@ -102,58 +141,82 @@ func (b *Bot) purgeRoutine() {
 	}()
 }
 
-// Creates the running routine that manages the radio signal.
-func (b *Bot) initRoutine() {
-	b.radioSignal = make(chan PkgRadio)
-	go b.GlobalRadio()
+func initRoutine() {
+	songSignal = make(chan PkgSong)
+	radioSignal = make(chan PkgRadio)
+	go GlobalPlay(songSignal)
+	go GlobalRadio(radioSignal)
 }
 
 // ConnectHandler
-func (b *Bot) ConnectHandler(s *discordgo.Session, connect *discordgo.Connect) {
+func ConnectHandler(s *discordgo.Session, connect *discordgo.Connect) {
 	log.Println("INFO: Connected!!")
-	s.UpdateStatus(0, b.config.DiscordStatus)
+	s.UpdateStatus(0, o.DiscordStatus)
 }
 
 // GuildCreateHandler
-func (b *Bot) GuildCreateHandler(s *discordgo.Session, guild *discordgo.GuildCreate) {
+func GuildCreateHandler(s *discordgo.Session, guild *discordgo.GuildCreate) {
 	log.Println("INFO: Guild Create:", guild.ID)
 }
 
 // GuildDeleteHandler
-func (b *Bot) GuildDeleteHandler(s *discordgo.Session, guild *discordgo.GuildDelete) {
+func GuildDeleteHandler(s *discordgo.Session, guild *discordgo.GuildDelete) {
 	log.Println("INFO: Guild Delete:", guild.ID)
-	v := b.voiceInstances[guild.ID]
+	v := voiceInstances[guild.ID]
 	if v != nil {
 		v.Stop()
 		time.Sleep(200 * time.Millisecond)
-		b.mutex.Lock()
-		delete(b.voiceInstances, guild.ID)
-		b.mutex.Unlock()
+		mutex.Lock()
+		delete(voiceInstances, guild.ID)
+		mutex.Unlock()
 	}
 }
 
 // MessageCreateHandler
-func (b *Bot) MessageCreateHandler(s *discordgo.Session, m *discordgo.MessageCreate) {
-	if !strings.HasPrefix(m.Content, b.config.DiscordPrefix) {
+func MessageCreateHandler(s *discordgo.Session, m *discordgo.MessageCreate) {
+	if !strings.HasPrefix(m.Content, o.DiscordPrefix) {
 		return
 	}
-
+	/*
+	  // Method with memory (volatile)
+	  guildID := SearchGuild(m.ChannelID)
+	  v := voiceInstances[guildID]
+	  owner, _:= s.Guild(guildID)
+	  content := strings.Replace(m.Content, o.DiscordPrefix, "", 1)
+	  command := strings.Fields(content)
+	  if len(command) == 0 {
+	    return
+	  }
+	  if owner.OwnerID == m.Author.ID {
+	    if strings.HasPrefix(command[0], "ignore") {
+	      ignore[m.ChannelID] = true
+	      ChMessageSend(m.ChannelID, "[**Music**] `Ignoring` comands in this channel!")
+	    }
+	    if strings.HasPrefix(command[0], "unignore") {
+	      if ignore[m.ChannelID] == true {
+	        delete(ignore, m.ChannelID)
+	        ChMessageSend(m.ChannelID, "[**Music**] `Unignoring` comands in this channel!")
+	      }
+	    }
+	  }
+	  if ignore[m.ChannelID] == true {
+	    return
+	  }
+	*/
 	// Method with database (persistent)
-	guildID := b.SearchGuild(m.ChannelID)
-	v := b.voiceInstances[guildID]
+	guildID := SearchGuild(m.ChannelID)
+	v := voiceInstances[guildID]
 	owner, _ := s.Guild(guildID)
-	content := strings.Replace(m.Content, b.config.DiscordPrefix, "", 1)
+	content := strings.Replace(m.Content, o.DiscordPrefix, "", 1)
 	command := strings.Fields(content)
-
 	if len(command) == 0 {
 		return
 	}
-
 	if owner.OwnerID == m.Author.ID {
 		if strings.HasPrefix(command[0], "ignore") {
 			err := PutDB(m.ChannelID, "true")
 			if err == nil {
-				b.ChMessageSend(m.ChannelID, "[**Music**] `Ignoring` comands in this channel!")
+				ChMessageSend(m.ChannelID, "[**Music**] `Ignoring` comands in this channel!")
 			} else {
 				log.Println("FATA: Error writing in DB,", err)
 			}
@@ -161,33 +224,31 @@ func (b *Bot) MessageCreateHandler(s *discordgo.Session, m *discordgo.MessageCre
 		if strings.HasPrefix(command[0], "unignore") {
 			err := PutDB(m.ChannelID, "false")
 			if err == nil {
-				b.ChMessageSend(m.ChannelID, "[**Music**] `Unignoring` comands in this channel!")
+				ChMessageSend(m.ChannelID, "[**Music**] `Unignoring` comands in this channel!")
 			} else {
 				log.Println("FATA: Error writing in DB,", err)
 			}
 		}
 	}
-
-	// Ignore command if it's in one of the "ignore commands from these channels" channels.
 	if GetDB(m.ChannelID) == "true" {
 		return
 	}
 
 	switch command[0] {
 		case "help":
-			b.HelpReporter(m)
+			HelpReporter(m)
 		case "join":
-			b.JoinReporter(v, m, s)
+			JoinReporter(v, m, s)
 		case "leave":
-			b.LeaveReporter(v, m)
+			LeaveReporter(v, m)
 		case "play":
-			b.PlayReporter(v, m)
+			PlayReporter(v, m)
 		case "stop":
-			b.StopReporter(v, m)
+			StopReporter(v, m)
 		case "np":
-			b.NowPlayingReporter(v, m)
+			NowPlayingReporter(v, m)
 		case "vol":
-			b.VolumeReporter(v, m)
+			VolumeReporter(v, m)
 		default:
 			return
 	}

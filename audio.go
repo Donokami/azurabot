@@ -7,58 +7,144 @@ import (
 	"time"
 )
 
-func (b *Bot) GlobalRadio() {
+const (
+	channels   int = 2     // 1 for mono, 2 for stereo
+	frameRate  int = 48000 // audio sampling rate
+	frameSize  int = 960   // uint16 size of each audio frame 960/48KHz = 20ms
+	bufferSize int = 1024  // max size of opus data 1K
+)
+
+/*
+func (v *VoiceInstance) InitVoice() {
+  v.songSig = make(chan PkgSong)
+  v.radioSig = make(chan PkgRadio)
+  v.endSig = make(chan bool)
+  v.speaking = false
+  go v.Play(v.songSig, v.radioSig, v.endSig)
+}
+*/
+/*
+func (v *VoiceInstance) Play(songSig chan Song, radioSig chan string, endSig chan bool) {
+  for {
+    select {
+      case song := <-songSig:
+        if v.radioFlag {
+          v.Stop()
+          time.Sleep(200 * time.Millisecond)
+        }
+        go v.PlayQueue(song)
+      case radio := <-radioSig:
+        v.Stop()
+        time.Sleep(200 * time.Millisecond)
+        go v.Radio(radio)
+      case <-endSig:
+        v.Stop()
+        return
+        //time.Sleep(200 * time.Millisecond)
+    }
+  }
+}
+*/
+
+func GlobalPlay(songSig chan PkgSong) {
 	for {
 		select {
-		case radio := <-b.radioSignal:
-			radio.v.Stop()
-			time.Sleep(200 * time.Millisecond)
-			go b.Radio(radio.data, radio.v)
+		case song := <-songSig:
+			if song.v.radioFlag {
+				song.v.Stop()
+				time.Sleep(200 * time.Millisecond)
+			}
+			go song.v.PlayQueue(song.data)
 		}
 	}
 }
 
-// Trigger to play radio.
-func (b *Bot) Radio(url string, v *VoiceInstance) {
+func GlobalRadio(radioSig chan PkgRadio) {
+	for {
+		select {
+		case radio := <-radioSig:
+			radio.v.Stop()
+			time.Sleep(200 * time.Millisecond)
+			go radio.v.Radio(radio.data)
+		}
+	}
+}
+
+func (v *VoiceInstance) PlayQueue(song Song) {
+	// add song to queue
+	v.QueueAdd(song)
+	if v.speaking {
+		// the bot is playing
+		return
+	}
+	go func() {
+		v.audioMutex.Lock()
+		defer v.audioMutex.Unlock()
+		for {
+			if len(v.queue) == 0 {
+				dg.UpdateStatus(0, o.DiscordStatus)
+				ChMessageSend(v.nowPlaying.ChannelID, "[**Music**] End of queue!")
+				return
+			}
+			v.nowPlaying = v.QueueGetSong()
+			go ChMessageSend(v.nowPlaying.ChannelID, "[**Music**] Playing, **`"+
+				v.nowPlaying.Title+"`  -  `("+v.nowPlaying.Duration+")`  -  **<@"+v.nowPlaying.ID+">\n") //*`"+ v.nowPlaying.User +"`***")
+			// If monoserver
+			if o.DiscordPlayStatus {
+				dg.UpdateStatus(0, v.nowPlaying.Title)
+			}
+			v.stop = false
+			v.skip = false
+			v.speaking = true
+			v.pause = false
+			v.voice.Speaking(true)
+
+			v.DCA(v.nowPlaying.VideoURL)
+
+			v.QueueRemoveFisrt()
+			if v.stop {
+				v.QueueRemove()
+			}
+			v.stop = false
+			v.skip = false
+			v.speaking = false
+			v.voice.Speaking(false)
+		}
+	}()
+}
+
+func (v *VoiceInstance) Radio(url string) {
 	v.audioMutex.Lock()
 	defer v.audioMutex.Unlock()
-
-	if b.config.DiscordPlayStatus {
-		b.dg.UpdateStatus(0, v.station.Name)
+	if o.DiscordPlayStatus {
+		dg.UpdateStatus(0, "Radio")
 	}
-
-	log.Println("INFO: Playing URL ", url)
-
+	v.radioFlag = true
+	v.stop = false
+	v.speaking = true
+	v.pause = false
 	v.voice.Speaking(true)
 
-	v.is_playing = true
+	v.DCA(url)
 
-	b.DCA(v, url)
-
-	v.is_playing = false
-
-	b.dg.UpdateStatus(0, b.config.DiscordStatus)
-
+	dg.UpdateStatus(0, o.DiscordStatus)
+	v.radioFlag = false
+	v.stop = false
+	v.speaking = false
 	v.voice.Speaking(false)
 }
 
-// Connector to the DCA audio playback library
-func (b *Bot) DCA(v *VoiceInstance, url string) {
+// DCA
+func (v *VoiceInstance) DCA(url string) {
 	opts := dca.StdEncodeOptions
 	opts.RawOutput = true
 	opts.Bitrate = 96
-
-	if v.volume != 0 {
-		opts.Volume = v.volume
-	} else {
-		opts.Volume = b.config.DiscordVolume
-	}
+	opts.Application = "lowdelay"
 
 	encodeSession, err := dca.EncodeFile(url, opts)
 	if err != nil {
 		log.Println("FATA: Failed creating an encoding session: ", err)
 	}
-
 	v.encoder = encodeSession
 	done := make(chan error)
 	stream := dca.NewStream(encodeSession, v.voice, done)
@@ -69,11 +155,47 @@ func (b *Bot) DCA(v *VoiceInstance, url string) {
 			if err != nil && err != io.EOF {
 				log.Println("FATA: An error occured", err)
 			}
-
-			// Clean up in case something happened and ffmpeg is still running
+			// Clean up incase something happened and ffmpeg is still running
 			encodeSession.Cleanup()
 			return
 		}
+	}
+}
+
+// Stop stop the audio
+func (v *VoiceInstance) Stop() {
+	v.stop = true
+	if v.encoder != nil {
+		v.encoder.Cleanup()
+	}
+}
+
+func (v *VoiceInstance) Skip() bool {
+	if v.speaking {
+		if v.pause {
+			return true
+		} else {
+			if v.encoder != nil {
+				v.encoder.Cleanup()
+			}
+		}
+	}
+	return false
+}
+
+// Pause pause the audio
+func (v *VoiceInstance) Pause() {
+	v.pause = true
+	if v.stream != nil {
+		v.stream.SetPaused(true)
+	}
+}
+
+// Resume resume the audio
+func (v *VoiceInstance) Resume() {
+	v.pause = false
+	if v.stream != nil {
+		v.stream.SetPaused(false)
 	}
 }
 
